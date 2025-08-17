@@ -3,17 +3,21 @@ from typing import Union
 
 # 3rd party dependencies
 from flask import Blueprint, request
+
 import numpy as np
 
 # project dependencies
 from deepface import DeepFace
+
 from deepface.api.src.modules.core import service
+
 from deepface.commons import image_utils
+
 from deepface.commons.logger import Logger
 
 logger = Logger()
 
-blueprint = Blueprint("routes", __name__)
+blueprint = Blueprint('routes', __name__)
 
 # pylint: disable=no-else-return, broad-except
 
@@ -158,7 +162,7 @@ def analyze():
         img_path=img,
         actions=actions,
         detector_backend=input_args.get("detector_backend", "opencv"),
-        enforce_detection=input_args.get("enforce_detection", True), # type: ignore 
+        enforce_detection=input_args.get("enforce_detection", True), # type: ignore
         align=input_args.get("align", True), # type: ignore
         anti_spoofing=input_args.get("anti_spoofing", False), # type: ignore
     )
