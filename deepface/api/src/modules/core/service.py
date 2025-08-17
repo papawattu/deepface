@@ -99,3 +99,30 @@ def analyze(
         logger.error(str(err))
         logger.error(tb_str)
         return {"error": f"Exception while analyzing: {str(err)} - {tb_str}"}, 400
+    
+def find(
+    img_path: Union[str, np.ndarray],
+    model_name: str,
+    detector_backend: str,
+    enforce_detection: bool,
+    align: bool,
+    anti_spoofing: bool,
+):
+    try:
+        result = {}
+        find_objs = DeepFace.find(
+            img_path=img_path,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=enforce_detection,
+            align=align,
+            anti_spoofing=anti_spoofing,
+            db_path="path/to/your/database"
+        )
+        result["results"] = find_objs
+        return result
+    except Exception as err:
+        tb_str = traceback.format_exc()
+        logger.error(str(err))
+        logger.error(tb_str)
+        return {"error": f"Exception while finding: {str(err)} - {tb_str}"}, 400

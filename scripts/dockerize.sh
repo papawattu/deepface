@@ -11,14 +11,14 @@ cd ..
 # docker rm -f $(docker ps -a -q --filter "ancestor=deepface")
 
 # build deepface image
-docker build -t deepface .
+docker build -t papawattu/deepface .
 
 # copy weights from your local
 # docker cp ~/.deepface/weights/. <CONTAINER_ID>:/root/.deepface/weights/
 
 # run the built image
 # docker run --net="host" deepface
-docker run -p 5005:5000 deepface
+docker run -p 5005:5000 papawattu/deepface
 
 # or pull the pre-built image from docker hub and run it
 # docker pull serengil/deepface
