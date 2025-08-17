@@ -107,20 +107,26 @@ def find(
     enforce_detection: bool,
     align: bool,
     anti_spoofing: bool,
+    db_path: str,
 ):
     try:
-        result = {}
-        find_objs = DeepFace.find(
+      
+        result = DeepFace.find(
             img_path=img_path,
             model_name=model_name,
             detector_backend=detector_backend,
             enforce_detection=enforce_detection,
             align=align,
             anti_spoofing=anti_spoofing,
-            db_path="path/to/your/database"
+            db_path=db_path
         )
-        result["results"] = find_objs
-        return result
+
+        if result:
+            if isinstance(result, list) and len(result) > 0:
+                return result[0].to_dict()  # type: ignore
+            return {"message": "No matches found."}
+        else:
+            return {"message": "No matches found."}
     except Exception as err:
         tb_str = traceback.format_exc()
         logger.error(str(err))

@@ -85,10 +85,10 @@ def represent():
         img_path=img,
         model_name=input_args.get("model_name", "VGG-Face"),
         detector_backend=input_args.get("detector_backend", "opencv"),
-        enforce_detection=input_args.get("enforce_detection", True),
-        align=input_args.get("align", True),
-        anti_spoofing=input_args.get("anti_spoofing", False),
-        max_faces=input_args.get("max_faces"),
+        enforce_detection=input_args.get("enforce_detection", True), # type: ignore
+        align=input_args.get("align", True), # type: ignore
+        anti_spoofing=input_args.get("anti_spoofing", False), # type: ignore
+        max_faces=input_args.get("max_faces"), # type: ignore
     )
 
     logger.debug(obj)
@@ -118,9 +118,9 @@ def verify():
         model_name=input_args.get("model_name", "VGG-Face"),
         detector_backend=input_args.get("detector_backend", "opencv"),
         distance_metric=input_args.get("distance_metric", "cosine"),
-        align=input_args.get("align", True),
-        enforce_detection=input_args.get("enforce_detection", True),
-        anti_spoofing=input_args.get("anti_spoofing", False),
+        align=input_args.get("align", True), # type: ignore
+        enforce_detection=input_args.get("enforce_detection", True), # type: ignore
+        anti_spoofing=input_args.get("anti_spoofing", False), # type: ignore
     )
 
     logger.debug(verification)
@@ -158,15 +158,15 @@ def analyze():
         img_path=img,
         actions=actions,
         detector_backend=input_args.get("detector_backend", "opencv"),
-        enforce_detection=input_args.get("enforce_detection", True),
-        align=input_args.get("align", True),
-        anti_spoofing=input_args.get("anti_spoofing", False),
+        enforce_detection=input_args.get("enforce_detection", True), # type: ignore 
+        align=input_args.get("align", True), # type: ignore
+        anti_spoofing=input_args.get("anti_spoofing", False), # type: ignore
     )
 
     logger.debug(demographies)
 
     return demographies
-@blueprint.route("/find", methods=["POST"])
+@blueprint.route("/find", methods=["POST"]) # type: ignore
 def find():
     input_args = (request.is_json and request.get_json()) or (
         request.form and request.form.to_dict()
@@ -179,11 +179,12 @@ def find():
 
     results = service.find(
         img_path=img,
-        db_path=input_args.get("db_path", "path/to/your/database"),
         model_name=input_args.get("model_name", "VGG-Face"),
         detector_backend=input_args.get("detector_backend", "opencv"),
-        align=input_args.get("align", True),
-        anti_spoofing=input_args.get("anti_spoofing", False),
+        enforce_detection=input_args.get("enforce_detection", True), # type: ignore
+        align=input_args.get("align", True), # type: ignore
+        anti_spoofing=input_args.get("anti_spoofing", False), # type: ignore
+        db_path=input_args.get("db_path", "path/to/your/database"),
     )
 
     logger.debug(results)
