@@ -13,12 +13,24 @@ cd ..
 # build deepface image
 docker build -t papawattu/deepface .
 
+# push to docker hub
+# docker login
+# docker tag deepface:latest serengil/deepface:latest
+# docker push serengil/deepface:latest
+
 # copy weights from your local
 # docker cp ~/.deepface/weights/. <CONTAINER_ID>:/root/.deepface/weights/
 
 # run the built image
 # docker run --net="host" deepface
-docker run -p 5005:5000 papawattu/deepface
+ENV_FILE="deepface/api/.env"
+if [ -f "$ENV_FILE" ]; then
+    echo ".env found, sending to container"
+    docker run -p 5005:5000 --env-file "$ENV_FILE" papawattu/deepface
+else
+    echo "no .env found, running container without env vars"
+    docker run -p 5005:5000 papawattu/deepface
+fi
 
 # or pull the pre-built image from docker hub and run it
 # docker pull serengil/deepface

@@ -1,30 +1,43 @@
 # built-in dependencies
 import os
 import pickle
-from typing import List, Union, Optional, Dict, Any, Set
+from typing import List, Union, Optional, Dict, Any, Set, IO, cast, Tuple
 import time
+import ast
 
 # 3rd party dependencies
 import numpy as np
+from numpy.typing import NDArray
 import pandas as pd
 from tqdm import tqdm
+from lightdsa import LightDSA
 
 # project dependencies
 from deepface.commons import image_utils
 from deepface.modules import representation, detection, verification
+from deepface.modules.exceptions import (
+    ImgNotFound,
+    PathNotFound,
+    EmptyDatasource,
+    SpoofDetected,
+    DimensionMismatchError,
+)
 from deepface.commons.logger import Logger
 
 logger = Logger()
 
 
+# pylint: disable=too-many-arguments, too-many-positional-arguments
 def find(
-    img_path: Union[str, np.ndarray],
+    img_path: Union[str, NDArray[Any], IO[bytes]],
     db_path: str,
     model_name: str = "VGG-Face",
     distance_metric: str = "cosine",
     enforce_detection: bool = True,
     detector_backend: str = "opencv",
     align: bool = True,
+    similarity_search: bool = False,
+    k: Optional[int] = None,
     expand_percentage: int = 0,
     threshold: Optional[float] = None,
     normalization: str = "base",
@@ -32,6 +45,7 @@ def find(
     refresh_database: bool = True,
     anti_spoofing: bool = False,
     batched: bool = False,
+    credentials: Optional[Union[LightDSA, Dict[str, Any]]] = None,
 ) -> Union[List[pd.DataFrame], List[List[Dict[str, Any]]]]:
     """
     Identify individuals in a database
@@ -54,10 +68,18 @@ def find(
             Default is True. Set to False to avoid the exception for low-resolution images.
 
         detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
-            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8','yolov11n', 'yolov11s',
-            'yolov11m', 'centerface' or 'skip'.
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip'.
 
         align (boolean): Perform alignment based on the eye positions.
+
+        similarity_search (boolean): If False, performs identity verification and returns images of
+            the same person. If True, performs similarity search and returns visually similar faces
+            (e.g., celebrity or parental look-alikes). Default is False.
+
+        k (int): Number of top similar faces to retrieve from the database for each detected face.
+            If not specified, all faces within the threshold will be returned (default is None).
 
         expand_percentage (int): expand detected facial area with a percentage (default is 0).
 
@@ -77,6 +99,19 @@ def find(
 
         anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
 
+        credentials (LightDSA or dict): public - private key pair. This will be used to sign
+            and verify the integrity of the datastore pickle file. Since pickle files are not safe
+            to load from untrusted sources, signing helps detect tampering and prevents loading a
+            modified datastore that could execute arbitrary code.
+
+            ```
+            from lightdsa import LightDSA
+            cs = LightDSA(algorithm_name = "eddsa")
+            DeepFace.find(..., credentials=cs)
+            # DeepFace.find(..., credentials={**cs.dsa.keys, "algorithm_name": cs.algorithm_name})
+            ```
+
+            See LightDSA repo for more details: https://github.com/serengil/LightDSA
 
     Returns:
         results (List[pd.DataFrame] or List[List[Dict[str, Any]]]):
@@ -113,11 +148,11 @@ def find(
     tic = time.time()
 
     if not os.path.isdir(db_path):
-        raise ValueError(f"Passed path {db_path} does not exist!")
+        raise PathNotFound(f"Passed path {db_path} does not exist!")
 
     img, _ = image_utils.load_image(img_path)
     if img is None:
-        raise ValueError(f"Passed image path {img_path} does not exist!")
+        raise ImgNotFound(f"Passed image path {img_path} does not exist!")
 
     file_parts = [
         "ds",
@@ -149,14 +184,12 @@ def find(
         "target_h",
     }
 
-    # Ensure the proper pickle file exists
+    # Ensure the proper datastore file exists
     if not os.path.exists(datastore_path):
-        with open(datastore_path, "wb") as f:
-            pickle.dump([], f, pickle.HIGHEST_PROTOCOL)
+        __save_representations(datastore_path=datastore_path, credentials=credentials)
 
-    # Load the representations from the pickle file
-    with open(datastore_path, "rb") as f:
-        representations = pickle.load(f)
+    # Load the representations from the existing datastore
+    representations = __load_representations(datastore_path=datastore_path, credentials=credentials)
 
     # check each item of representations list has required keys
     for i, current_representation in enumerate(representations):
@@ -171,9 +204,9 @@ def find(
     storage_images = set(image_utils.yield_images(path=db_path))
 
     if len(storage_images) == 0 and refresh_database is True:
-        raise ValueError(f"No item found in {db_path}")
+        raise EmptyDatasource(f"No item found in {db_path}")
     if len(representations) == 0 and refresh_database is False:
-        raise ValueError(f"Nothing is found in {datastore_path}")
+        raise EmptyDatasource(f"Nothing is found in {datastore_path}")
 
     must_save_pickle = False
     new_images, old_images, replaced_images = set(), set(), set()
@@ -234,8 +267,9 @@ def find(
         must_save_pickle = True
 
     if must_save_pickle:
-        with open(datastore_path, "wb") as f:
-            pickle.dump(representations, f, pickle.HIGHEST_PROTOCOL)
+        __save_representations(
+            datastore_path=datastore_path, representations=representations, credentials=credentials
+        )
         if not silent:
             logger.info(f"There are now {len(representations)} representations in {file_name}")
 
@@ -250,27 +284,35 @@ def find(
     # now, we got representations for facial database
 
     # img path might have more than once face
-    source_objs = detection.extract_faces(
-        img_path=img_path,
-        detector_backend=detector_backend,
-        grayscale=False,
-        enforce_detection=enforce_detection,
-        align=align,
-        expand_percentage=expand_percentage,
-        anti_spoofing=anti_spoofing,
+    source_objs: List[Dict[str, Any]] = cast(
+        List[Dict[str, Any]],
+        detection.extract_faces(
+            img_path=img_path,
+            detector_backend=detector_backend,
+            grayscale=False,
+            enforce_detection=enforce_detection,
+            align=align,
+            expand_percentage=expand_percentage,
+            anti_spoofing=anti_spoofing,
+        ),
     )
+
+    pretuned_threshold = verification.find_threshold(model_name, distance_metric)
+    target_threshold = threshold or pretuned_threshold
 
     if batched:
         return find_batched(
-            representations,
-            source_objs,
-            model_name,
-            distance_metric,
-            enforce_detection,
-            align,
-            threshold,
-            normalization,
-            anti_spoofing,
+            representations=representations,
+            source_objs=source_objs,
+            model_name=model_name,
+            distance_metric=distance_metric,
+            enforce_detection=enforce_detection,
+            align=align,
+            threshold=target_threshold,
+            normalization=normalization,
+            anti_spoofing=anti_spoofing,
+            similarity_search=similarity_search,
+            k=k,
         )
 
     df = pd.DataFrame(representations)
@@ -282,7 +324,7 @@ def find(
 
     for source_obj in source_objs:
         if anti_spoofing is True and source_obj.get("is_real", True) is False:
-            raise ValueError("Spoof detected in the given image.")
+            raise SpoofDetected("Spoof detected in the given image.")
         source_img = source_obj["face"]
         source_region = source_obj["facial_area"]
         target_embedding_obj = representation.represent(
@@ -293,13 +335,10 @@ def find(
             align=align,
             normalization=normalization,
         )
-
+        target_embedding_obj = cast(List[Dict[str, Any]], target_embedding_obj)
         target_representation = target_embedding_obj[0]["embedding"]
 
         result_df = df.copy()  # df will be filtered in each img
-
-        pretuned_threshold = verification.find_threshold(model_name, distance_metric)
-        target_threshold = threshold or pretuned_threshold
 
         result_df["threshold"] = target_threshold
         result_df["source_x"] = source_region["x"]
@@ -307,32 +346,39 @@ def find(
         result_df["source_w"] = source_region["w"]
         result_df["source_h"] = source_region["h"]
 
-        distances = []
-        confidences = []
+        distances: List[float] = []
+        confidences: List[float] = []
         for _, instance in df.iterrows():
             source_representation = instance["embedding"]
             if source_representation is None:
-                distances.append(float("inf"))  # no representation for this image
+                # no representation for this image
+                distances.append(float("inf"))
+                confidences.append(0.0)
                 continue
 
             target_dims = len(list(target_representation))
             source_dims = len(list(source_representation))
             if target_dims != source_dims:
-                raise ValueError(
+                raise DimensionMismatchError(
                     "Source and target embeddings must have same dimensions but "
                     + f"{target_dims}:{source_dims}. Model structure may change"
                     + " after pickle created. Delete the {file_name} and re-run."
                 )
 
-            distance = verification.find_distance(
-                source_representation, target_representation, distance_metric
+            distance: float = float(
+                cast(
+                    np.float64,
+                    verification.find_distance(
+                        source_representation, target_representation, distance_metric
+                    ),
+                )
             )
 
             confidence = verification.find_confidence(
                 distance=distance,
                 model_name=model_name,
                 distance_metric=distance_metric,
-                verified=distance <= pretuned_threshold,
+                verified=bool(distance <= pretuned_threshold),
             )
 
             distances.append(distance)
@@ -345,8 +391,14 @@ def find(
 
         result_df = result_df.drop(columns=["embedding"])
         # pylint: disable=unsubscriptable-object
-        result_df = result_df[result_df["distance"] <= result_df["threshold"]]
+
+        if similarity_search is False:
+            result_df = result_df[result_df["distance"] <= result_df["threshold"]]
+
         result_df = result_df.sort_values(by=["distance"], ascending=True).reset_index(drop=True)
+
+        if k is not None and len(result_df) > k:
+            result_df = result_df.head(k)
 
         resp_obj.append(result_df)
 
@@ -405,14 +457,17 @@ def __find_bulk_embeddings(
         file_hash = image_utils.find_image_hash(employee)
 
         try:
-            img_objs = detection.extract_faces(
-                img_path=employee,
-                detector_backend=detector_backend,
-                grayscale=False,
-                enforce_detection=enforce_detection,
-                align=align,
-                expand_percentage=expand_percentage,
-                color_face="bgr",  # `represent` expects images in bgr format.
+            img_objs: List[Dict[str, Any]] = cast(
+                List[Dict[str, Any]],
+                detection.extract_faces(
+                    img_path=employee,
+                    detector_backend=detector_backend,
+                    grayscale=False,
+                    enforce_detection=enforce_detection,
+                    align=align,
+                    expand_percentage=expand_percentage,
+                    color_face="bgr",  # `represent` expects images in bgr format.
+                ),
             )
 
         except ValueError as err:
@@ -443,7 +498,7 @@ def __find_bulk_embeddings(
                     align=align,
                     normalization=normalization,
                 )
-
+                embedding_obj = cast(List[Dict[str, Any]], embedding_obj)
                 img_representation = embedding_obj[0]["embedding"]
                 representations.append(
                     {
@@ -470,6 +525,8 @@ def find_batched(
     threshold: Optional[float] = None,
     normalization: str = "base",
     anti_spoofing: bool = False,
+    similarity_search: bool = False,
+    k: Optional[int] = None,
 ) -> List[List[Dict[str, Any]]]:
     """
     Perform batched face recognition by comparing source face embeddings with a set of
@@ -518,42 +575,53 @@ def find_batched(
 
         anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
 
+        similarity_search (boolean): If False, performs identity verification and returns images of
+            the same person. If True, performs similarity search and returns visually similar faces
+            (e.g., celebrity or parental look-alikes). Default is False.
+
+        k (int): Number of top similar faces to retrieve from the database for each detected face.
+            If not specified, all faces within the threshold will be returned (default is None).
+
     Returns:
         List[List[Dict[str, Any]]]:
             A list where each element corresponds to a source face and
             contains a list of dictionaries with matching faces.
     """
     embeddings_list = []
-    valid_mask = []
-    metadata = set()
+    valid_mask_lst = []
+    metadata: Set[str] = set()
 
     for item in representations:
         emb = item.get("embedding")
         if emb is not None:
             embeddings_list.append(emb)
-            valid_mask.append(True)
+            valid_mask_lst.append(True)
         else:
             embeddings_list.append(np.zeros_like(representations[0]["embedding"]))
-            valid_mask.append(False)
+            valid_mask_lst.append(False)
 
         metadata.update(item.keys())
 
     # remove embedding key from other keys
     metadata.discard("embedding")
-    metadata = list(metadata)
+    metadata_lst = list(metadata)
 
     embeddings = np.array(embeddings_list)  # (N, D)
-    valid_mask = np.array(valid_mask)  # (N,)
+    valid_mask = np.array(valid_mask_lst)  # (N,)
 
-    data = {key: np.array([item.get(key, None) for item in representations]) for key in metadata}
+    data = {
+        key: np.array([item.get(key, None) for item in representations]) for key in metadata_lst
+    }
 
     target_embeddings = []
     source_regions = []
     target_thresholds = []
 
+    target_threshold = threshold if similarity_search is False else np.inf
+
     for source_obj in source_objs:
         if anti_spoofing and not source_obj.get("is_real", True):
-            raise ValueError("Spoof detected in the given image.")
+            raise SpoofDetected("Spoof detected in the given image.")
 
         source_img = source_obj["face"]
         source_region = source_obj["facial_area"]
@@ -567,16 +635,15 @@ def find_batched(
             normalization=normalization,
         )
         # it is safe to access 0 index because we already fed detected face to represent function
+        target_embedding_obj = cast(List[Dict[str, Any]], target_embedding_obj)
         target_representation = target_embedding_obj[0]["embedding"]
 
         target_embeddings.append(target_representation)
         source_regions.append(source_region)
-
-        target_threshold = threshold or verification.find_threshold(model_name, distance_metric)
         target_thresholds.append(target_threshold)
 
-    target_embeddings = np.array(target_embeddings)  # (M, D)
-    target_thresholds = np.array(target_thresholds)  # (M,)
+    target_embeddings_np = np.array(target_embeddings)  # (M, D)
+    target_thresholds_np = np.array(target_thresholds)  # (M,)
     source_regions_arr = {
         "source_x": np.array([region["x"] for region in source_regions]),
         "source_y": np.array([region["y"] for region in source_regions]),
@@ -584,14 +651,16 @@ def find_batched(
         "source_h": np.array([region["h"] for region in source_regions]),
     }
 
-    distances = verification.find_distance(embeddings, target_embeddings, distance_metric)  # (M, N)
+    distances: NDArray[Any] = cast(
+        NDArray[Any],
+        verification.find_distance(embeddings, target_embeddings_np, distance_metric),
+    )  # (M, N)
     distances[:, ~valid_mask] = np.inf
 
     resp_obj = []
-
-    for i in range(len(target_embeddings)):
+    for i in range(len(target_embeddings_np)):
         target_distances = distances[i]  # (N,)
-        target_threshold = target_thresholds[i]
+        target_threshold = target_thresholds_np[i]
 
         N = embeddings.shape[0]
         result_data = dict(data)
@@ -607,6 +676,7 @@ def find_batched(
         )
 
         mask = target_distances <= target_threshold
+
         filtered_data = {key: value[mask] for key, value in result_data.items()}
 
         sorted_indices = np.argsort(filtered_data["distance"])
@@ -616,5 +686,204 @@ def find_batched(
         result_dicts = [
             {key: sorted_data[key][i] for key in sorted_data} for i in range(num_results)
         ]
+
+        if k is not None and len(result_dicts) > k:
+            result_dicts = result_dicts[:k]
+
         resp_obj.append(result_dicts)
     return resp_obj
+
+
+def __save_representations(
+    datastore_path: str,
+    representations: Optional[List[Dict[str, Any]]] = None,
+    credentials: Optional[Union[LightDSA, Dict[str, Any]]] = None,
+) -> None:
+    """
+    Save representations to a pickle file
+
+    Args:
+        datastore_path (str): path to the pickle file
+        representations (list): list of representations to be saved
+        credentials (LightDSA or dict): public - private key pair as LightDSA object or dictionary.
+            This is going to be used to sign the integrity of the datastore pickle file.
+            If not provided, the datastore will not be signed.
+    """
+    with open(datastore_path, "wb") as f:
+        pickle.dump(representations or [], f, pickle.HIGHEST_PROTOCOL)
+
+    __sign_datastore(datastore_path=datastore_path, credentials=credentials)
+
+
+def __load_representations(
+    datastore_path: str, credentials: Optional[Union[LightDSA, Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Load representations from a pickle file
+
+    Args:
+        datastore_path (str): path to the pickle file
+        credentials (LightDSA or dict): public - private key pair as LightDSA object or dictionary.
+            This is going to be used to sign the integrity of the datastore pickle file.
+            If not provided, the datastore will not be signed.
+    Returns:
+        representations (list): list of loaded representations
+    """
+    __verify_signature(datastore_path=datastore_path, credentials=credentials)
+
+    with open(datastore_path, "rb") as f:
+        representations = pickle.load(f)
+
+    if not isinstance(representations, list) or not all(
+        isinstance(x, dict) for x in representations
+    ):
+        raise ValueError("Invalid datastore format")
+
+    return cast(List[Dict[str, Any]], representations)
+
+
+def __build_dsa(credentials: Union[LightDSA, Dict[str, Any]]) -> LightDSA:
+    """
+    Build LightDSA object from credentials
+    Args:
+        credentials (LightDSA or dict): public - private key pair as LightDSA object or dictionary.
+    Returns:
+        dsa (LightDSA): LightDSA object
+    """
+    if isinstance(credentials, dict):
+        if "algorithm_name" not in credentials:
+            raise ValueError("credentials dictionary must have 'algorithm_name' key.")
+        dsa = LightDSA(
+            algorithm_name=credentials["algorithm_name"],
+            form_name=credentials.get("form_name"),
+            curve_name=credentials.get("curve_name"),
+            keys=credentials,
+        )
+    elif isinstance(credentials, LightDSA):
+        dsa = credentials
+    else:
+        raise ValueError("credentials must be either LightDSA or dict type.")
+    return dsa
+
+
+def __sign_datastore(
+    datastore_path: str, credentials: Optional[Union[LightDSA, Dict[str, Any]]] = None
+) -> None:
+    """
+    Sign the datastore pickle file
+    Args:
+        datastore_path (str): path to the pickle file
+        credentials (LightDSA or dict): public - private key pair as LightDSA object or dictionary.
+            This is going to be used to sign the integrity of the datastore pickle file.
+            If not provided, the datastore will not be signed.
+    """
+    if credentials is None:
+        logger.debug("No credentials provided. Skipping datastore signing.")
+        return
+
+    dsa = __build_dsa(credentials=credentials)
+
+    with open(datastore_path, "rb") as f:
+        data: bytes = f.read()
+
+    signature = dsa.sign(message=data)
+    with open(datastore_path + ".ldsa", "w", encoding="utf-8") as f:
+        f.write(repr(signature))
+
+    logger.debug(f"Datastore pickle {datastore_path} signed successfully.")
+
+
+def __verify_signature(
+    datastore_path: str, credentials: Optional[Union[LightDSA, Dict[str, Any]]] = None
+) -> None:
+    """
+    Verify the signature of a datastore pickle file
+
+    Args:
+        datastore_path (str): path to the pickle file
+        credentials (LightDSA or dict): public - private key pair as LightDSA object or dictionary.
+            This is going to be used to sign the integrity of the datastore pickle file.
+            If not provided, the datastore will not be signed.
+    """
+    signature_path = datastore_path + ".ldsa"
+    if credentials is None:
+        if not os.path.exists(signature_path):
+            logger.debug("No credentials provided. Skipping signature verification.")
+            return
+        raise ValueError(
+            f"Credentials not provided but signature file {signature_path} exists."
+            "Cannot verify the datastore without credentials."
+        )
+
+    dsa = __build_dsa(credentials=credentials)
+
+    algorithm_name = dsa.algorithm_name
+
+    with open(datastore_path, "rb") as f:
+        data: bytes = f.read()
+
+    if not os.path.exists(signature_path):
+        raise ValueError(
+            f"Signature file {signature_path} not found."
+            "You may need to re-create the pickle by deleting the existing one."
+        )
+
+    with open(signature_path, "r", encoding="utf-8") as f:
+        signature_unified = f.read()
+
+    try:
+        signature: Union[Tuple[int, int], Tuple[Tuple[int, int], int], int] = ast.literal_eval(
+            signature_unified
+        )
+    except SyntaxError as err:
+        raise ValueError(
+            f"Signature content must be python literal. Verify the signature {signature_path}"
+        ) from err
+
+    if algorithm_name == "rsa":
+        if not isinstance(signature, int):
+            raise ValueError(
+                f"Invalid signature format for RSA algorithm. Verify the signature {signature_path}"
+            )
+    elif algorithm_name == "dsa":
+        if (
+            not isinstance(signature, tuple)
+            or len(signature) != 2
+            or not all(isinstance(x, int) for x in signature)
+        ):
+            raise ValueError(
+                f"DSA signature must be Tuple[int, int]. Verify the signature {signature_path}"
+            )
+    elif algorithm_name == "eddsa":
+        if (
+            not isinstance(signature, tuple)  # pylint: disable=too-many-boolean-expressions
+            or len(signature) != 2
+            or not isinstance(signature[0], tuple)
+            or len(signature[0]) != 2
+            or not all(isinstance(x, int) for x in signature[0])
+            or not isinstance(signature[1], int)
+        ):
+            raise ValueError(
+                "EdDSA signature must be Tuple[Tuple[int, int], int]."
+                f"Verify the signature {signature_path}"
+            )
+    elif algorithm_name == "ecdsa":
+        if (
+            not isinstance(signature, tuple)
+            or len(signature) != 2
+            or not all(isinstance(x, int) for x in signature)
+        ):
+            raise ValueError(
+                f"ECDSA signature must be Tuple[int, int]. Verify the signature {signature_path}"
+            )
+    else:
+        raise ValueError(f"Unsupported algorithm_name: {algorithm_name}")
+
+    # this will raise exception if verification fails
+    is_verified = dsa.verify(message=data, signature=signature)
+
+    # still check the boolean result
+    if not is_verified:
+        raise ValueError("Datastore pickle signature verification failed.")
+
+    logger.info(f"Datastore pickle {datastore_path} signature verified successfully.")

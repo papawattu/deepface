@@ -19,19 +19,18 @@ from packaging import version
 from deepface.api.src.app import create_app
 from deepface.api.src.modules.core import routes
 from deepface.commons.logger import Logger
+from deepface.modules.detection import extract_faces, DetectedFace, FacialAreaRegion
+from deepface.modules import detection
 
 logger = Logger()
 
-IMG1_SOURCE = (
-    "https://raw.githubusercontent.com/serengil/deepface/refs/heads/master/tests/dataset/img1.jpg"
-)
-IMG2_SOURCE = (
-    "https://raw.githubusercontent.com/serengil/deepface/refs/heads/master/tests/dataset/img2.jpg"
-)
+IMG1_SOURCE = "https://raw.githubusercontent.com/serengil/deepface/refs/heads/master/tests/unit/dataset/img1.jpg"
+IMG2_SOURCE = "https://raw.githubusercontent.com/serengil/deepface/refs/heads/master/tests/unit/dataset/img2.jpg"
 DUMMY_APP = Flask(__name__)
 
 
-class TestVerifyEndpoint(unittest.TestCase):
+# pylint: disable=too-many-public-methods, too-many-positional-arguments
+class TestApiFunctions(unittest.TestCase):
     def setUp(self):
         download_test_images(IMG1_SOURCE)
         download_test_images(IMG2_SOURCE)
@@ -140,7 +139,7 @@ class TestVerifyEndpoint(unittest.TestCase):
         data = {
             "model_name": "Facenet",
             "detector_backend": "mtcnn",
-            "img": "https://github.com/serengil/deepface/blob/master/tests/dataset/couple.jpg?raw=true",
+            "img": "https://github.com/serengil/deepface/blob/master/tests/unit/dataset/couple.jpg?raw=true",
         }
 
         response = self.app.post("/represent", json=data)
@@ -191,7 +190,7 @@ class TestVerifyEndpoint(unittest.TestCase):
             # image path
             image_path,
             # image url
-            f"https://github.com/serengil/deepface/blob/master/tests/{image_path}?raw=true",
+            f"https://github.com/serengil/deepface/blob/master/tests/unit/{image_path}?raw=true",
             # encoded image
             encoded_image,
         ]
@@ -304,8 +303,8 @@ class TestVerifyEndpoint(unittest.TestCase):
                     "detector_backend": "mtcnn",
                 },
             )
-            assert response.status_code == 200
             result = response.json
+            assert response.status_code == 200, response.data
             assert isinstance(result, dict)
             assert result.get("age") is not True
             assert result.get("dominant_gender") is not True
@@ -328,7 +327,7 @@ class TestVerifyEndpoint(unittest.TestCase):
                         "distance_metric": "euclidean",
                     },
                 )
-                assert response.status_code == 200
+                assert response.status_code == 200, response.data
                 result = response.json
                 assert isinstance(result, dict)
                 assert result.get("verified") is not None
@@ -450,6 +449,141 @@ class TestVerifyEndpoint(unittest.TestCase):
         logger.info("✅ test extract_image_from_request for image string from form done")
 
 
+class TestTokenValidation(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {
+            "DEEPFACE_AUTH_TOKEN": "some_token",
+            "DEEPFACE_CONNECTION_DETAILS": "some_connection_string",
+        },
+    )
+    def setUp(self):
+        app = create_app()
+        app.config["DEBUG"] = True
+        app.config["TESTING"] = True
+        self.app = app.test_client()
+        self.payloads = [
+            ("/verify", {"img1": "dataset/img1.jpg", "img2": "dataset/img2.jpg"}),
+            ("/represent", {"img": "dataset/img1.jpg"}),
+            ("/analyze", {"img": "dataset/img1.jpg"}),
+            ("/register", {"img": "dataset/img1.jpg"}),
+            ("/build/index", {}),
+            ("/search", {"img": "dataset/img1.jpg"}),
+        ]
+
+    def test_missing_token(self):
+        for endpoint, data in self.payloads:
+            response = self.app.post(endpoint, json=data)
+            assert response.status_code == 401
+            logger.info(f"✅ missing bearer token test for {endpoint} is done")
+
+    def test_invalid_token(self):
+        for endpoint, data in self.payloads:
+            response = self.app.post(
+                endpoint, json=data, headers={"Authorization": "Bearer wrong_token"}
+            )
+            assert response.status_code == 401
+            logger.info(f"✅ invalid bearer token test for {endpoint} is done")
+
+    @patch("deepface.api.src.modules.core.service.build_index")
+    @patch("deepface.api.src.modules.core.service.search")
+    @patch("deepface.api.src.modules.core.service.register")
+    @patch("deepface.api.src.modules.core.service.represent")
+    @patch("deepface.api.src.modules.core.service.analyze")
+    @patch("deepface.api.src.modules.core.service.verify")
+    def test_valid_token(
+        self,
+        mock_verify,
+        mock_analyze,
+        mock_represent,
+        mock_register,
+        mock_search,
+        mock_build_index,
+    ):
+        mock_verify.return_value = ({"verified": True}, 200)
+        mock_analyze.return_value = ({"results": []}, 200)
+        mock_represent.return_value = ({"results": []}, 200)
+        mock_register.return_value = ({"inserted": 1}, 200)
+        mock_search.return_value = ({"results": []}, 200)
+        mock_build_index.return_value = ({"message": "Index built successfully"}, 200)
+
+        for endpoint, data in self.payloads:
+            response = self.app.post(
+                endpoint, json=data, headers={"Authorization": "Bearer some_token"}
+            )
+            assert (
+                response.status_code == 200
+            ), f"Failed at {endpoint} with status {response.status_code}"
+            logger.info(f"✅ valid bearer token test for {endpoint} is done")
+
+
+class TestConnectionStringFailedValidation(unittest.TestCase):
+    def setUp(self):
+        os.environ.pop("DEEPFACE_CONNECTION_DETAILS", None)
+        os.environ.pop("DEEPFACE_POSTGRES_URI", None)
+
+        app = create_app()
+        app.config["DEBUG"] = True
+        app.config["TESTING"] = True
+        self.app = app.test_client()
+
+    def test_register(self):
+        response = self.app.post("/register", json={})
+        assert response.status_code == 500
+        logger.info("✅ invalid connection string test for /register is done")
+
+    def test_build_index(self):
+        response = self.app.post("/build/index", json={})
+        assert response.status_code == 500
+        logger.info("✅ invalid connection string test for /build/index is done")
+
+    def test_search(self):
+        response = self.app.post("/search", json={})
+        assert response.status_code == 500
+        logger.info("✅ invalid connection string test for /search is done")
+
+
+class TestConnectionStringSucceddedValidation(unittest.TestCase):
+    @patch.dict(os.environ, {"DEEPFACE_CONNECTION_DETAILS": "some_connection_string"})
+    def setUp(self):
+        self.patcher_register = patch("deepface.api.src.modules.core.service.register")
+        self.patcher_search = patch("deepface.api.src.modules.core.service.search")
+        self.patcher_build_index = patch("deepface.api.src.modules.core.service.build_index")
+
+        self.mock_register = self.patcher_register.start()
+        self.mock_search = self.patcher_search.start()
+        self.mock_build_index = self.patcher_build_index.start()
+
+        self.mock_register.return_value = ({"inserted": 1}, 200)
+        self.mock_search.return_value = ({"results": []}, 200)
+        self.mock_build_index.return_value = ({"message": "Index built successfully"}, 200)
+
+        app = create_app()
+        app.config["DEBUG"] = True
+        app.config["TESTING"] = True
+        self.app = app.test_client()
+
+    def tearDown(self):
+        self.patcher_register.stop()
+        self.patcher_search.stop()
+        self.patcher_build_index.stop()
+
+    def test_register(self):
+        response = self.app.post("/register", json={"img": "dataset/img1.jpg"})
+        assert response.status_code == 200, response.data
+        logger.info("✅ successful connection string test for /register is done")
+
+    def test_build_index(self):
+        response = self.app.post("/build/index", json={})
+        assert response.status_code == 200, response.data
+        logger.info("✅ successful connection string test for /build/index is done")
+
+    def test_search(self):
+        response = self.app.post("/search", json={"img": "dataset/img1.jpg"})
+        assert response.status_code == 200, response.data
+        logger.info("✅ successful connection string test for /search is done")
+
+
 def download_test_images(url: str):
     file_name = url.split("/")[-1]
     target_file = f"/tmp/{file_name}"
@@ -477,3 +611,55 @@ def is_form_data_file_testable() -> bool:
             f"Expected <= {threshold_version}, but {flask_version=} and {werkzeus_version}."
         )
     return is_testable
+
+
+def test_landmarks_are_raw_python_types(monkeypatch):
+    """
+    Tests that the landmarks returned by extract_faces are of raw Python types (int, tuple of ints).
+        This is important for compatibility with frameworks like Flask that may have issues
+        serializing NumPy types.
+    """
+    fake_landmarks = {
+        "x": 10,
+        "y": np.int64(15),
+        "w": 200,
+        "h": 200,
+        "left_eye": np.array([50, 60], dtype=np.int64),
+        "right_eye": np.array([150, 60], dtype=np.int32),
+        "nose": (100, 100),
+        "confidence": 1,
+    }
+
+    def fake_detect_faces(**kwargs):
+        return [
+            DetectedFace(
+                img=np.zeros((200, 200, 3), dtype=np.uint8),
+                facial_area=FacialAreaRegion(
+                    x=fake_landmarks["x"],
+                    y=fake_landmarks["y"],
+                    w=fake_landmarks["w"],
+                    h=fake_landmarks["h"],
+                    confidence=fake_landmarks["confidence"],
+                    left_eye=fake_landmarks["left_eye"],
+                    right_eye=fake_landmarks["right_eye"],
+                    nose=fake_landmarks["nose"],
+                ),
+                confidence=fake_landmarks["confidence"],
+            )
+        ]
+
+    monkeypatch.setattr(detection, "detect_faces", fake_detect_faces)
+
+    def fake_load_image(*args, **kwargs):
+        return np.zeros((200, 200, 3), dtype=np.uint8), "fake.jpg"
+
+    monkeypatch.setattr(detection.image_utils, "load_image", fake_load_image)
+
+    results = extract_faces("fake_path.jpg", detector_backend="opencv", enforce_detection=True)
+
+    landmarks = results[0]["facial_area"]
+    for _, value in landmarks.items():
+        if isinstance(value, tuple):
+            assert all(isinstance(coord, int) for coord in value)
+        else:
+            assert isinstance(value, int)
