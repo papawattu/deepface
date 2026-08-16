@@ -1,13 +1,13 @@
-# Use NVIDIA CUDA base image with Python 3.8
+# Use NVIDIA CUDA base image with Python 3.11
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install Python 3.8 and pip
+# Install Python 3.11 and pip
 RUN apt-get update && \
-    apt-get install -y python3.8 python3-pip && \
-    ln -sf python3.8 /usr/bin/python3 && \
-    ln -sf python3.8 /usr/bin/python
+    apt-get install -y python3.11 python3-pip && \
+    ln -sf python3.11 /usr/bin/python3 && \
+    ln -sf python3.11 /usr/bin/python
 
 LABEL org.opencontainers.image.source=https://github.com/serengil/deepface
 
